@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#f9f9f9">
-<title>posi0nSword</title>
+<title>etasw0rd</title>
 <style>
   :root { --green: #3d9459; --hairline: rgba(60,60,67,.29); }
   html, body { margin:0; padding:0; height:100%; background:#f2f2f7; overscroll-behavior:none; }
@@ -97,7 +97,7 @@
   <div class="navbar">
     <div class="row">
       <button class="navbtn" id="aboutBtn">About</button>
-      <div class="navtitle">posi0nSword</div>
+      <div class="navtitle">etasw0rd</div>
       <button class="navbtn" id="creditsBtn">Credits</button>
     </div>
   </div>
@@ -360,7 +360,7 @@
                 // inject the server origin so the worker's synchronous slog() can reach /log,
                 // and the page-side device fingerprint so loadOffsets picks the right JSON
                 workerCode = "self.__SLOG_ORIGIN=" + JSON.stringify(location.origin) + ";\n" +
-                    "self.__DEVICE_INFO=" + JSON.stringify(devInfo || null) + ";\n" + getJS(`do_chain.js`);
+                    "self.__DEVICE_INFO=" + JSON.stringify(devInfo || null) + ";\n" + getJS(`do_chain.js?_=${Date.now()}`);
                 let workerBlob = new Blob([workerCode], { type: 'text/javascript' });
                 let workerBlobUrl = URL.createObjectURL(workerBlob);
 
@@ -710,13 +710,14 @@ break;
                     title: "About",
                     html:
                         `<p>(Incomplete) port of the Darksword webkit userland chain for iOS 26.1</p>` +
-                        `<p class="muted">Repo: <a href="https://github.com/GenericCoding/pois0nSword">Proudly open source and hosted on Github</a></p>`
+                        `<p class="muted">Repo: <a href="https://github.com/xnupwn/etasw0rd">Proudly open source and hosted on Github</a></p>`
                 },
                 credits: {
                     title: "Credits",
                     html:
                         `<p class="muted"><b>Contributors:</b></p>` +
                         `<div class="rows">` +
+                        `<div class="row"><span class="k">Primary developer: </span><span class="v">xnupwn<br></span></div>` +
                         `<div class="row"><span class="k">Primary developer: </span><span class="v">GenericCoding<br>(<a href="https://x.com/GenericCoding">@GenericCoding</a>)</span></div>` +
                         `<div class="row"><span class="k">Primary developer: </span><span class="v">Varik<br>(<a href="https://x.com/D4RK7ET">@D4RK7ET</a>)</span></div>` +
                         `<div class="row"><span class="k">Debugging and webcontent R/W fix:</span><span class="v">Johnny<br>(<a href="https://x.com/zeroxjf">@zeroxjf</a>)</span></div>` +
@@ -754,5 +755,6 @@ break;
 
         });
     </script>
+<div style="position:fixed;bottom:4px;right:10px;color:#999;font-size:10px;font-family:monospace;z-index:999;pointer-events:none;">v5-skipTTS</div>
 </body>
 </html>
